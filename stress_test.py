@@ -10,7 +10,7 @@ def run_stress_test():
     
     # 啟動 Driver 作為子進程
     process = subprocess.Popen(
-        ['./driver'],
+        ['./driver', '0'],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

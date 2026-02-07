@@ -14,8 +14,7 @@
 struct GPUState* gpu;
 
 // --- 1. ARM64 Assembly Optimization ---
-// 使用 ARM64 組合語言實作高效加法
-// %w0 = 32-bit register (w0, w1...)
+
 uint32_t asm_add(uint32_t a, uint32_t b) {
     uint32_t res;
     // volatile 告訴編譯器不要優化這段 Code，必須執行
@@ -51,7 +50,7 @@ void* watchdog_thread(void* arg) {
             
             // 注意：如果主執行緒卡在 while(true)，這裡通常需要 kill process
             // 但為了讓 Streamlit 繼續顯示，我們這裡只做標記
-            // 真實情況：exit(1); 讓 systemd 重啟服務
+            // 真實情況：exit(1); 
         }
         sleep(1);
     }
@@ -96,6 +95,8 @@ void process_command(int tenant_id, Command& cmd) {
                     put_pixel(x + dx, y + dy, color);
                 }
             }
+            gpu->temperature += 0.8f;
+            usleep(500);
             break;
         }
         case CMD_DMA_TEXTURE: {

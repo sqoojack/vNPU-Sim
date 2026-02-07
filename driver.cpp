@@ -24,6 +24,8 @@ void send_command(Command cmd) {
     ctx->tail = next_tail;
     pthread_cond_signal(&ctx->not_empty);
     pthread_mutex_unlock(&ctx->lock);
+
+    std::cout << "[Driver] Success: Command sent" << std::endl;
 }
 
 void print_menu() {
