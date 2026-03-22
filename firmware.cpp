@@ -1,156 +1,177 @@
-// g++ firmware.cpp -o firmware -lpthread
-// ./firmware
 #include <iostream>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <unistd.h>
+#include <csignal>
 #include <atomic>
-#include <stdexcept>
 #include <thread>
 #include <cstring>
-#include "vgpu_common.h"
+#include "vnpu_common.h"
 
-class VgpuDevice {
-private:
-    int fd;
-    vgpu_shared_state* mem;
+vnpu_shared_state* global_npu_ptr = nullptr;
 
+
+enum class LogLevel { INFO, WARN, ERROR, FATAL };
+
+class Logger {
 public:
-    VgpuDevice(const char* path) {
-        fd = open(path, O_RDWR);
-        if (fd < 0) throw std::runtime_error("Failed to open /dev/vgpu0. Did you load the LKM?");
-        mem = static_cast<vgpu_shared_state*>(
-            mmap(nullptr, sizeof(vgpu_shared_state), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
-        );
-        if (mem == MAP_FAILED) { close(fd); throw std::runtime_error("Mmap failed"); }
+    static void log(LogLevel level, const std::string& msg) {
+        static std::mutex log_mutex;
+        std::lock_guard<std::mutex> lock(log_mutex);
+
+        // 嘗試開啟檔案 (注意：寫入 /var/log 通常需要 sudo 權限)
+        std::ofstream log_file("/var/log/vnpu_firmware.log", std::ios::app);
+        
+        auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::string label;
+        switch (level) {
+            case LogLevel::INFO:  label = "[INFO]"; break;
+            case LogLevel::WARN:  label = "[WARN]"; break;
+            case LogLevel::ERROR: label = "[ERROR]"; break;
+            case LogLevel::FATAL: label = "[FATAL]"; break;
+        }
+
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&now), "%Y-%m-%d %H:%M:%S") << " " << label << " " << msg << std::endl;
+        
+        // 同時輸出到檔案與標準輸出
+        if (log_file.is_open()) log_file << ss.str();
+        std::cout << ss.str(); 
     }
-    ~VgpuDevice() {
-        if (mem != MAP_FAILED) munmap(mem, sizeof(vgpu_shared_state));
-        if (fd >= 0) close(fd);
-    }
-    vgpu_shared_state* get_mem() const { return mem; }
-    int get_fd() const { return fd; }
 };
 
-// --- 舊有邏輯：ARM64 組合語言 ---
-uint32_t asm_add(uint32_t a, uint32_t b) {
-    uint32_t res;
-    __asm__ volatile ("add %w0, %w1, %w2" : "=r" (res) : "r" (a), "r" (b));
-    return res;
+// 1. Crash Dump 攔截器
+void crash_handler(int sig, siginfo_t *info, void *context) {
+    if (!global_npu_ptr) _exit(1);
+    
+    int fd = open("crash_dump.bin", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd >= 0) {
+        // Dump Head/Tail 指標
+        write(fd, &global_npu_ptr->head, sizeof(__u32));
+        write(fd, &global_npu_ptr->tail, sizeof(__u32));
+        // Dump Ring Buffer 狀態
+        write(fd, global_npu_ptr->ring, sizeof(vnpu_command) * RING_BUFFER_SIZE);
+        // Dump NPU 記憶體前 1KB
+        write(fd, global_npu_ptr->npu_mem, 1024);
+        close(fd);
+    }
+    const char msg[] = "\n[CRITICAL] SIGSEGV detected. Crash dump written to crash_dump.bin\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(1);
 }
 
-// --- 舊有邏輯：Watchdog ---
-void watchdog_thread(vgpu_shared_state* gpu) {
-    std::cout << "[Watchdog] Monitoring thread started..." << std::endl;
-    while (gpu->running) {
-        uint64_t current_time = (uint64_t)time(NULL);
-        if (current_time - gpu->last_heartbeat > 3) {
-            std::cerr << "\n[!!! CRITICAL !!!] WATCHDOG TIMEOUT DETECTED! Hard Resetting..." << std::endl;
-            gpu->watchdog_reset_count++;
-            gpu->temperature = 37.0f;
-            gpu->last_heartbeat = current_time; 
-            memset(gpu->vram, 0, sizeof(gpu->vram)); // 清空 VRAM 以示重置
+// 2. TCP Socket Server 執行緒
+void tcp_server_thread(vnpu_shared_state* npu) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    struct sockaddr_in address;
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(8080);
+    
+    bind(server_fd, (struct sockaddr *)&address, sizeof(address));
+    listen(server_fd, 3);
+    
+    while (npu->running) {
+        int client = accept(server_fd, NULL, NULL);
+        if (client < 0) continue;
+        
+        uint8_t mode;
+        if (read(client, &mode, 1) > 0) {
+            if (mode == 0) {
+                // Mode 0: 傳送目前的 NPU 狀態與記憶體給 Python Client
+                write(client, npu, sizeof(vnpu_shared_state));
+            } else if (mode == 1) {
+                // Mode 1: 接收 Python Client 傳來的類神經網路權重
+                uint32_t offset, size_in_bytes;
+                read(client, &offset, 4);
+                read(client, &size_in_bytes, 4);
+                read(client, (uint8_t*)npu->npu_mem + offset, size_in_bytes);
+            }
         }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        close(client);
     }
 }
 
-void put_pixel(vgpu_shared_state* gpu, int x, int y, uint32_t color) {
-    if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
-        gpu->vram[y * WIDTH + x] = color;
-    }
-}
-
-void process_command(vgpu_shared_state* gpu, vgpu_command& cmd) {
+// 3. 處理矩陣相乘指令
+void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
     switch (cmd.type) {
-        case 1: { // CMD_CLEAR
-            uint32_t color = cmd.params[0];
-            for (int i = 0; i < WIDTH * HEIGHT; ++i) gpu->vram[i] = color;
+        case CMD_MATRIX_MULTIPLY: {
+            uint32_t offA = cmd.params[0], offB = cmd.params[1], offC = cmd.params[2];
+            uint32_t dim = cmd.params[3]; // NxN 矩陣
+            
+            float* A = &npu->npu_mem[offA];
+            float* B = &npu->npu_mem[offB];
+            float* C = &npu->npu_mem[offC];
+            
+            for (uint32_t i = 0; i < dim; ++i) {
+                for (uint32_t j = 0; j < dim; ++j) {
+                    float sum = 0;
+                    for (uint32_t k = 0; k < dim; ++k) {
+                        sum += A[i * dim + k] * B[k * dim + j];
+                    }
+                    C[i * dim + j] = sum;
+                }
+            }
+            npu->temperature += 1.5f; // 模擬運算發熱
             break;
         }
-        case 2: { // CMD_DRAW_RECT
-            int x = cmd.params[0], y = cmd.params[1], w = cmd.params[2], h = cmd.params[3];
-            uint32_t color = cmd.params[4];
-            for (int dy = 0; dy < h; ++dy)
-                for (int dx = 0; dx < w; ++dx)
-                    put_pixel(gpu, x + dx, y + dy, color);
-            gpu->temperature += 0.8f;
-            break;
-        }
-        case 4: { // CMD_CHECKSUM (ARM64 ASM)
-            uint32_t res = asm_add(cmd.params[0], cmd.params[1]);
-            std::cout << "[ASM Accelerator] Result = " << res << std::endl;
-            break;
-        }
-        case 9: { // CMD_HANG
-            std::cout << "[Firmware] Received HANG. Freezing..." << std::endl;
-            while(true) { usleep(100); } // 故意卡死，觸發 Watchdog
+        case CMD_HANG: {
+            int* bad_ptr = nullptr;
+            *bad_ptr = 42; // 故意觸發 SIGSEGV 測試 Crash Dump
             break;
         }
     }
 }
 
 int main() {
-    try {
-        VgpuDevice dev("/dev/vgpu0");
-        vgpu_shared_state* gpu = dev.get_mem();
+    // 註冊 Crash Dump 攔截器
+    struct sigaction sa;
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = crash_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
 
-        // 註冊 eventfd 中斷
-        int irq_fd = eventfd(0, EFD_NONBLOCK);
-        if (ioctl(dev.get_fd(), VGPU_IOCTL_SET_EVENTFD, irq_fd) < 0) {
-            throw std::runtime_error("Failed to register IRQ");
-        }
+    int fd = open("/dev/vnpu0", O_RDWR);
+    if (fd < 0) return 1;
+    
+    vnpu_shared_state* npu = static_cast<vnpu_shared_state*>(
+        mmap(nullptr, sizeof(vnpu_shared_state), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+    );
+    global_npu_ptr = npu;
 
-        // 初始化遙測數據
-        gpu->temperature = 37.0f;
-        gpu->last_heartbeat = (uint64_t)time(NULL);
+    int irq_fd = eventfd(0, EFD_NONBLOCK);
+    ioctl(fd, VNPU_IOCTL_SET_EVENTFD, irq_fd);
 
-        // 啟動 Watchdog (改用 C++11 std::thread)
-        std::thread wd_thread(watchdog_thread, gpu);
-        wd_thread.detach();
+    npu->temperature = 37.0f;
+    
+    // 啟動網路連線執行緒
+    std::thread net_thread(tcp_server_thread, npu);
+    net_thread.detach();
 
-        std::cout << "[vGPU Firmware] Booted. Waiting for Kernel IRQ..." << std::endl;
+    std::atomic<uint32_t>* head = reinterpret_cast<std::atomic<uint32_t>*>(&npu->head);
+    std::atomic<uint32_t>* tail = reinterpret_cast<std::atomic<uint32_t>*>(&npu->tail);
+    uint64_t irq_count;
 
-        std::atomic<uint32_t>* head = reinterpret_cast<std::atomic<uint32_t>*>(&gpu->head);
-        std::atomic<uint32_t>* tail = reinterpret_cast<std::atomic<uint32_t>*>(&gpu->tail);
-        uint64_t irq_count;
+    while (npu->running) {
+        if (read(irq_fd, &irq_count, sizeof(irq_count)) > 0) {
+            uint32_t current_tail = tail->load(std::memory_order_acquire);
+            uint32_t current_head = head->load(std::memory_order_relaxed);
 
-        while (gpu->running) {
-            gpu->last_heartbeat = (uint64_t)time(NULL); // 餵狗
-            gpu->frame_counter++;
-
-            // 溫度降頻與冷卻邏輯
-            if (gpu->temperature > 85.0f) {
-                std::cout << "[Thermal] Overheating! Throttling..." << std::endl;
-                usleep(50000); // 降頻
-                gpu->temperature -= 0.5f;
-            } else if (gpu->temperature > 37.0f) {
-                gpu->temperature -= 0.01f; // 自然冷卻
+            while (current_head != current_tail) {
+                process_command(npu, npu->ring[current_head]);
+                current_head = (current_head + 1) % RING_BUFFER_SIZE;
             }
-
-            // 阻塞等待中斷 (Polling eventfd，使用 select 或直接 non-block read)
-            if (read(irq_fd, &irq_count, sizeof(irq_count)) > 0) {
-                // 收到 Kernel 通知，處理 Ring Buffer
-                uint32_t current_tail = tail->load(std::memory_order_acquire);
-                uint32_t current_head = head->load(std::memory_order_relaxed);
-
-                while (current_head != current_tail) {
-                    vgpu_command cmd = gpu->ring[current_head];
-                    process_command(gpu, cmd);
-                    current_head = (current_head + 1) % RING_BUFFER_SIZE;
-                }
-                
-                head->store(current_head, std::memory_order_release);
-            } else {
-                usleep(1000); // Idle 狀態
-            }
+            head->store(current_head, std::memory_order_release);
+        } else {
+            usleep(1000);
         }
-        close(irq_fd);
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        return 1;
     }
     return 0;
 }

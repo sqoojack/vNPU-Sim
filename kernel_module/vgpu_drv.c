@@ -74,18 +74,29 @@ static struct file_operations fops = {
 
 static int __init vgpu_init(void) {
     dev_t dev;
-    alloc_chrdev_region(&dev, 0, 1, DEVICE_NAME);
+    if (alloc_chrdev_region(&dev, 0, 1, DEVICE_NAME) < 0) {
+        printk(KERN_ERR "vNPU: Failed to allocate char device region\n"); // 使用 KERN_ERR
+        return -1;
+    }
     major_num = MAJOR(dev);
     cdev_init(&vgpu_cdev, &fops);
-    cdev_add(&vgpu_cdev, dev, 1);
+    if (cdev_add(&vgpu_cdev, dev, 1) < 0) {
+        printk(KERN_ERR "vNPU: Failed to add cdev\n");
+        unregister_chrdev_region(dev, 1);
+        return -1;
+    }
 
-    // 配置頁面對齊的核心記憶體
     shared_mem = vmalloc_user(sizeof(struct vgpu_shared_state));
+    if (!shared_mem) {
+        printk(KERN_ERR "vNPU: Failed to allocate shared memory\n");
+        return -ENOMEM;
+    }
+    
     memset(shared_mem, 0, sizeof(struct vgpu_shared_state));
     shared_mem->magic = 0x56475055;
     shared_mem->running = 1;
 
-    printk(KERN_INFO "vGPU Driver loaded: /dev/%s\n", DEVICE_NAME);
+    printk(KERN_INFO "vNPU Driver loaded: /dev/%s\n", DEVICE_NAME); // 使用 KERN_INFO
     return 0;
 }
 
