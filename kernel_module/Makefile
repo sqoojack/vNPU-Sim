@@ -1,4 +1,4 @@
-obj-m += vgpu_drv.o
+obj-m += vnpu_drv.o
 
 all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules

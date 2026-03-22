@@ -11,62 +11,71 @@
 #include <thread>
 #include <cstring>
 #include <fstream>
-#include <sstream>
-#include <iomanip>
-#include <chrono>
-#include <mutex>
+#include <ucontext.h>
 #include "vnpu_common.h" 
-
 #include "vnpu_logger.h"
+
 #define LOG_FILE "firmware.log"
 #define TAG "Firmware"
 
 vnpu_shared_state* global_npu_ptr = nullptr;
 
-enum class LogLevel { INFO, WARN, ERROR, FATAL };
-
-class Logger {
-public:
-    static void log(LogLevel level, const std::string& msg) {
-        static std::mutex log_mutex;
-        std::lock_guard<std::mutex> lock(log_mutex);
-
-        std::ofstream log_file("firmware.log", std::ios::app);
-        
-        auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-        std::string label;
-        switch (level) {
-            case LogLevel::INFO:  label = "[INFO]"; break;
-            case LogLevel::WARN:  label = "[WARN]"; break;
-            case LogLevel::ERROR: label = "[ERROR]"; break;
-            case LogLevel::FATAL: label = "[FATAL]"; break;
-        }
-
-        std::stringstream ss;
-        ss << std::put_time(std::localtime(&now), "%Y-%m-%d %H:%M:%S") << " " << label << " " << msg << std::endl;
-        
-        if (log_file.is_open()) log_file << ss.str();
-        std::cout << ss.str(); 
-    }
-};
-
-#define LOG_INFO(msg) Logger::log(LogLevel::INFO, msg)
-#define LOG_ERROR(msg) Logger::log(LogLevel::ERROR, msg)
-#define LOG_FATAL(msg) Logger::log(LogLevel::FATAL, msg)
-
+// 系統級 Crash Dump 攔截
 void crash_handler(int sig, siginfo_t *info, void *context) {
     if (!global_npu_ptr) _exit(1);
     
+    ucontext_t *uc = (ucontext_t *)context;
+    std::ofstream report("crash_report.txt");
+    
+    report << "=== FATAL: Hardware Fault Detected ===\n";
+    report << "Signal Number: " << sig << "\n";
+    report << "Faulting Memory Address: " << info->si_addr << "\n";
+    
+    // 提取架構相關暫存器狀態 (支援 x86_64 與 ARM64)
+#ifdef __x86_64__
+    report << "RIP: 0x" << std::hex << uc->uc_mcontext.gregs[REG_RIP] << "\n";
+    report << "RSP: 0x" << std::hex << uc->uc_mcontext.gregs[REG_RSP] << "\n";
+    report << "RBP: 0x" << std::hex << uc->uc_mcontext.gregs[REG_RBP] << "\n";
+#elif defined(__aarch64__)
+    report << "PC: 0x" << std::hex << uc->uc_mcontext.pc << "\n";
+    report << "SP: 0x" << std::hex << uc->uc_mcontext.sp << "\n";
+    report << "X0: 0x" << std::hex << uc->uc_mcontext.regs[0] << "\n";
+#endif
+
+    report << "\n[Ring Buffer Snapshot]\n";
+    report << "Head: " << global_npu_ptr->head << " | Tail: " << global_npu_ptr->tail << "\n";
+    report.close();
+
+    // 寫入完整記憶體快照
     int fd = open("crash_dump.bin", O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd >= 0) {
-        write(fd, &global_npu_ptr->head, sizeof(__u32));
-        write(fd, &global_npu_ptr->tail, sizeof(__u32));
-        write(fd, global_npu_ptr->ring, sizeof(vnpu_command) * RING_BUFFER_SIZE);
-        write(fd, global_npu_ptr->npu_mem, 1024);
+        write(fd, global_npu_ptr, sizeof(vnpu_shared_state));
         close(fd);
     }
-    LOG_FATAL("SIGSEGV detected. Crash dump written to crash_dump.bin");
+    
+    LOG_FATAL("SIGSEGV captured. Wrote crash_report.txt and crash_dump.bin", LOG_FILE, TAG);
     _exit(1);
+}
+
+// 確保 TCP 串流完整收發的 Helper 函數
+bool recv_all(int socket, uint8_t* buffer, size_t length) {
+    size_t bytes_received = 0;
+    while (bytes_received < length) {
+        ssize_t result = read(socket, buffer + bytes_received, length - bytes_received);
+        if (result <= 0) return false;
+        bytes_received += result;
+    }
+    return true;
+}
+
+bool send_all(int socket, const uint8_t* buffer, size_t length) {
+    size_t bytes_sent = 0;
+    while (bytes_sent < length) {
+        ssize_t result = write(socket, buffer + bytes_sent, length - bytes_sent);
+        if (result <= 0) return false;
+        bytes_sent += result;
+    }
+    return true;
 }
 
 void tcp_server_thread(vnpu_shared_state* npu) {
@@ -82,22 +91,26 @@ void tcp_server_thread(vnpu_shared_state* npu) {
     bind(server_fd, (struct sockaddr *)&address, sizeof(address));
     listen(server_fd, 3);
     
-    LOG_INFO("TCP Server listening on port 8080");
+    LOG_INFO("TCP Server listening on port 8080", LOG_FILE, TAG);
 
     while (npu->running) {
         int client = accept(server_fd, NULL, NULL);
         if (client < 0) continue;
         
         uint8_t mode;
-        if (read(client, &mode, 1) > 0) {
+        if (recv_all(client, &mode, 1)) {
             if (mode == 0) {
-                write(client, npu, sizeof(vnpu_shared_state));
+                send_all(client, (const uint8_t*)npu, sizeof(vnpu_shared_state));
             } else if (mode == 1) {
                 uint32_t offset, size_in_bytes;
-                read(client, &offset, 4);
-                read(client, &size_in_bytes, 4);
-                read(client, (uint8_t*)npu->npu_mem + offset, size_in_bytes);
-                LOG_INFO("Received AI weights via TCP");
+                if (recv_all(client, (uint8_t*)&offset, 4) && recv_all(client, (uint8_t*)&size_in_bytes, 4)) {
+                    // 記憶體越界阻擋機制 (Buffer Overflow Protection)
+                    if (offset + size_in_bytes <= NPU_MEM_SIZE * sizeof(float)) {
+                        recv_all(client, (uint8_t*)npu->npu_mem + offset, size_in_bytes);
+                    } else {
+                        LOG_ERROR("TCP Write blocked: Out of bounds", LOG_FILE, TAG);
+                    }
+                }
             }
         }
         close(client);
@@ -110,6 +123,12 @@ void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
             uint32_t offA = cmd.params[0], offB = cmd.params[1], offC = cmd.params[2];
             uint32_t dim = cmd.params[3]; 
             
+            // 加入維度檢查避免記憶體越界
+            if ((offA + dim*dim > NPU_MEM_SIZE) || (offB + dim*dim > NPU_MEM_SIZE) || (offC + dim*dim > NPU_MEM_SIZE)) {
+                LOG_ERROR("CMD_MATRIX_MULTIPLY bounds check failed", LOG_FILE, TAG);
+                break;
+            }
+
             float* A = &npu->npu_mem[offA];
             float* B = &npu->npu_mem[offB];
             float* C = &npu->npu_mem[offC];
@@ -124,11 +143,10 @@ void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
                 }
             }
             npu->temperature += 1.5f; 
-            LOG_INFO("Processed CMD_MATRIX_MULTIPLY");
             break;
         }
         case CMD_HANG: {
-            LOG_ERROR("Executing CMD_HANG - Triggering intentional SIGSEGV");
+            LOG_ERROR("Executing CMD_HANG - Triggering intentional SIGSEGV", LOG_FILE, TAG);
             volatile int* bad_ptr = nullptr;
             *bad_ptr = 42; 
             break;
@@ -137,7 +155,6 @@ void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
 }
 
 int main() {
-    LOG_INFO("Firmware system starting...", LOG_FILE, TAG);
     struct sigaction sa;
     sa.sa_flags = SA_SIGINFO;
     sa.sa_sigaction = crash_handler;
@@ -145,10 +162,7 @@ int main() {
     sigaction(SIGSEGV, &sa, NULL);
 
     int fd = open("/dev/vnpu0", O_RDWR);
-    if (fd < 0) {
-        LOG_FATAL("Failed to open /dev/vnpu0. Is the kernel module loaded?");
-        return 1;
-    }
+    if (fd < 0) return 1;
     
     vnpu_shared_state* npu = static_cast<vnpu_shared_state*>(
         mmap(nullptr, sizeof(vnpu_shared_state), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
@@ -159,7 +173,7 @@ int main() {
     ioctl(fd, VNPU_IOCTL_SET_EVENTFD, irq_fd);
 
     npu->temperature = 37.0f;
-    LOG_INFO("Firmware initialized successfully");
+    npu->running = 1;
     
     std::thread net_thread(tcp_server_thread, npu);
     net_thread.detach();
@@ -179,7 +193,7 @@ int main() {
             }
             head->store(current_head, std::memory_order_release);
         } else {
-            usleep(1000);
+            usleep(1000); // 建議後續替換為 epoll 或 poll 監聽 eventfd，減少 CPU 負載
         }
     }
     return 0;
