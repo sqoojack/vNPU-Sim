@@ -10,10 +10,18 @@
 #include <atomic>
 #include <thread>
 #include <cstring>
-#include "vnpu_common.h"
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <chrono>
+#include <mutex>
+#include "vnpu_common.h" 
+
+#include "vnpu_logger.h"
+#define LOG_FILE "firmware.log"
+#define TAG "Firmware"
 
 vnpu_shared_state* global_npu_ptr = nullptr;
-
 
 enum class LogLevel { INFO, WARN, ERROR, FATAL };
 
@@ -23,8 +31,7 @@ public:
         static std::mutex log_mutex;
         std::lock_guard<std::mutex> lock(log_mutex);
 
-        // 嘗試開啟檔案 (注意：寫入 /var/log 通常需要 sudo 權限)
-        std::ofstream log_file("/var/log/vnpu_firmware.log", std::ios::app);
+        std::ofstream log_file("firmware.log", std::ios::app);
         
         auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
         std::string label;
@@ -38,33 +45,30 @@ public:
         std::stringstream ss;
         ss << std::put_time(std::localtime(&now), "%Y-%m-%d %H:%M:%S") << " " << label << " " << msg << std::endl;
         
-        // 同時輸出到檔案與標準輸出
         if (log_file.is_open()) log_file << ss.str();
         std::cout << ss.str(); 
     }
 };
 
-// 1. Crash Dump 攔截器
+#define LOG_INFO(msg) Logger::log(LogLevel::INFO, msg)
+#define LOG_ERROR(msg) Logger::log(LogLevel::ERROR, msg)
+#define LOG_FATAL(msg) Logger::log(LogLevel::FATAL, msg)
+
 void crash_handler(int sig, siginfo_t *info, void *context) {
     if (!global_npu_ptr) _exit(1);
     
     int fd = open("crash_dump.bin", O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd >= 0) {
-        // Dump Head/Tail 指標
         write(fd, &global_npu_ptr->head, sizeof(__u32));
         write(fd, &global_npu_ptr->tail, sizeof(__u32));
-        // Dump Ring Buffer 狀態
         write(fd, global_npu_ptr->ring, sizeof(vnpu_command) * RING_BUFFER_SIZE);
-        // Dump NPU 記憶體前 1KB
         write(fd, global_npu_ptr->npu_mem, 1024);
         close(fd);
     }
-    const char msg[] = "\n[CRITICAL] SIGSEGV detected. Crash dump written to crash_dump.bin\n";
-    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    LOG_FATAL("SIGSEGV detected. Crash dump written to crash_dump.bin");
     _exit(1);
 }
 
-// 2. TCP Socket Server 執行緒
 void tcp_server_thread(vnpu_shared_state* npu) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
@@ -78,6 +82,8 @@ void tcp_server_thread(vnpu_shared_state* npu) {
     bind(server_fd, (struct sockaddr *)&address, sizeof(address));
     listen(server_fd, 3);
     
+    LOG_INFO("TCP Server listening on port 8080");
+
     while (npu->running) {
         int client = accept(server_fd, NULL, NULL);
         if (client < 0) continue;
@@ -85,26 +91,24 @@ void tcp_server_thread(vnpu_shared_state* npu) {
         uint8_t mode;
         if (read(client, &mode, 1) > 0) {
             if (mode == 0) {
-                // Mode 0: 傳送目前的 NPU 狀態與記憶體給 Python Client
                 write(client, npu, sizeof(vnpu_shared_state));
             } else if (mode == 1) {
-                // Mode 1: 接收 Python Client 傳來的類神經網路權重
                 uint32_t offset, size_in_bytes;
                 read(client, &offset, 4);
                 read(client, &size_in_bytes, 4);
                 read(client, (uint8_t*)npu->npu_mem + offset, size_in_bytes);
+                LOG_INFO("Received AI weights via TCP");
             }
         }
         close(client);
     }
 }
 
-// 3. 處理矩陣相乘指令
 void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
     switch (cmd.type) {
         case CMD_MATRIX_MULTIPLY: {
             uint32_t offA = cmd.params[0], offB = cmd.params[1], offC = cmd.params[2];
-            uint32_t dim = cmd.params[3]; // NxN 矩陣
+            uint32_t dim = cmd.params[3]; 
             
             float* A = &npu->npu_mem[offA];
             float* B = &npu->npu_mem[offB];
@@ -119,19 +123,21 @@ void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
                     C[i * dim + j] = sum;
                 }
             }
-            npu->temperature += 1.5f; // 模擬運算發熱
+            npu->temperature += 1.5f; 
+            LOG_INFO("Processed CMD_MATRIX_MULTIPLY");
             break;
         }
         case CMD_HANG: {
-            int* bad_ptr = nullptr;
-            *bad_ptr = 42; // 故意觸發 SIGSEGV 測試 Crash Dump
+            LOG_ERROR("Executing CMD_HANG - Triggering intentional SIGSEGV");
+            volatile int* bad_ptr = nullptr;
+            *bad_ptr = 42; 
             break;
         }
     }
 }
 
 int main() {
-    // 註冊 Crash Dump 攔截器
+    LOG_INFO("Firmware system starting...", LOG_FILE, TAG);
     struct sigaction sa;
     sa.sa_flags = SA_SIGINFO;
     sa.sa_sigaction = crash_handler;
@@ -139,7 +145,10 @@ int main() {
     sigaction(SIGSEGV, &sa, NULL);
 
     int fd = open("/dev/vnpu0", O_RDWR);
-    if (fd < 0) return 1;
+    if (fd < 0) {
+        LOG_FATAL("Failed to open /dev/vnpu0. Is the kernel module loaded?");
+        return 1;
+    }
     
     vnpu_shared_state* npu = static_cast<vnpu_shared_state*>(
         mmap(nullptr, sizeof(vnpu_shared_state), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
@@ -150,8 +159,8 @@ int main() {
     ioctl(fd, VNPU_IOCTL_SET_EVENTFD, irq_fd);
 
     npu->temperature = 37.0f;
+    LOG_INFO("Firmware initialized successfully");
     
-    // 啟動網路連線執行緒
     std::thread net_thread(tcp_server_thread, npu);
     net_thread.detach();
 
