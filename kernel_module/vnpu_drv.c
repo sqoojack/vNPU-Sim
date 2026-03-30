@@ -10,6 +10,9 @@
 
 #define DEVICE_NAME "vnpu0"
 
+static struct class *vnpu_class = NULL;
+static struct device *vnpu_device = NULL;
+
 static int major_num;
 static struct cdev vnpu_cdev;
 static struct vnpu_shared_state *shared_mem;
@@ -52,7 +55,7 @@ static long vnpu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
             spin_unlock(&ring_lock);
 
             if (irq_ctx) {
-                eventfd_signal(irq_ctx, 1);
+                eventfd_signal(irq_ctx);
             }
             break;
 
@@ -100,6 +103,21 @@ static int __init vnpu_init(void) {
         printk(KERN_ERR "vNPU: Failed to allocate shared memory\n");
         return -ENOMEM;
     }
+
+    vnpu_class = class_create(DEVICE_NAME);
+    if (IS_ERR(vnpu_class)) {
+        cdev_del(&vnpu_cdev);
+        unregister_chrdev_region(dev, 1);
+        return PTR_ERR(vnpu_class);
+    }
+
+    vnpu_device = device_create(vnpu_class, NULL, dev, NULL, DEVICE_NAME);
+    if (IS_ERR(vnpu_device)) {
+        class_destroy(vnpu_class);
+        cdev_del(&vnpu_cdev);
+        unregister_chrdev_region(dev, 1);
+        return PTR_ERR(vnpu_device);
+    }
     
     memset(shared_mem, 0, sizeof(struct vnpu_shared_state));
     shared_mem->magic = 0x564E5055; 
@@ -110,7 +128,12 @@ static int __init vnpu_init(void) {
 }
 
 static void __exit vnpu_exit(void) {
-    if (irq_ctx) eventfd_ctx_put(irq_ctx);
+    if (vnpu_device) device_destroy(vnpu_class, MKDEV(major_num, 0));
+    if (vnpu_class) class_destroy(vnpu_class);
+    if (irq_ctx) {
+        eventfd_ctx_put(irq_ctx);
+        irq_ctx = NULL;
+    }
     if (shared_mem) vfree(shared_mem);
     cdev_del(&vnpu_cdev);
     unregister_chrdev_region(MKDEV(major_num, 0), 1);

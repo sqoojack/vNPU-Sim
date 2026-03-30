@@ -3,14 +3,28 @@
 # Exit immediately if a command exits with a non-zero status
 set -e
 
+echo "=== 0. Force Cleanup Previous Session ==="
+# Kill any running firmware or driver instances
+pkill -f "./build/firmware" || true
+pkill -f "./build/driver" || true
+
+# If the device is still busy, force close the file descriptor
+if [ -e /dev/vnpu0 ]; then
+    sudo fuser -k /dev/vnpu0 || true
+fi
+
+# Remove old module if it exists
+if lsmod | grep -q "vnpu_drv"; then
+    echo "Unloading existing vnpu_drv..."
+    sudo rmmod vnpu_drv
+fi
+
 echo "=== 1. Compile and Load Kernel Module ==="
 cd kernel_module
 make
-# Remove old module if it exists
-sudo rmmod vnpu_drv 2>/dev/null || true
 sudo insmod vnpu_drv.ko
-# Ensure device node permissions
-sudo chmod 666 /dev/vnpu0
+# Node should be auto-created if you updated the C code with device_create()
+# If not, you might still need: sudo chmod 666 /dev/vnpu0
 cd ..
 
 echo "=== 2. Build C++ Firmware and Driver ==="
@@ -32,7 +46,7 @@ echo "=== 4. Launch Streamlit App ==="
 # Run the Streamlit application
 streamlit run scripts/app.py
 
-# Cleanup background processes and kernel module on exit
-kill $FW_PID
-sudo rmmod vnpu_drv
-echo "System shutdown complete and resources cleaned up."
+# Final Cleanup when Streamlit exits
+kill $FW_PID || true
+sudo rmmod vnpu_drv || true
+echo "System shutdown complete."

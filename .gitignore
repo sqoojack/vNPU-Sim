@@ -1,3 +1,14 @@
 notes/
 Demo_video/
 *.bin
+
+*.o
+*.ko
+*.mod.c
+*.mod
+*.order
+*.symvers
+.*.cmd
+.tmp_versions/
+build/
+*.log
