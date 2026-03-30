@@ -10,16 +10,22 @@ int tenant_id = -1;
 int dev_fd = -1;
 
 void send_command(vnpu_command cmd) {
-    int ret = ioctl(dev_fd, VNPU_IOCTL_SUBMIT_CMD, &cmd);
     
-    if (ret < 0) {
-        if (errno == EBUSY) {
-            std::cout << "[Driver Client] Buffer full. Command rejected by Kernel." << std::endl;
+    while (true) {
+        int ret = ioctl(dev_fd, VNPU_IOCTL_SUBMIT_CMD, &cmd);
+        
+        if (ret < 0) {
+            if (errno == EBUSY) {
+                std::cout << "[Driver Client] Buffer full. Retrying in 1ms..." << std::endl;
+                usleep(1000);
+            } else {
+                perror("[Driver Client] IOCTL failed");
+                break;
+            }
         } else {
-            perror("[Driver Client] IOCTL failed");
+            std::cout << "[Driver Client] Success: Command submitted to Kernel" << std::endl;
+            break;
         }
-    } else {
-        std::cout << "[Driver Client] Success: Command submitted to Kernel" << std::endl;
     }
 }
 
@@ -57,11 +63,10 @@ int main(int argc, char** argv) {
         switch(choice) {
             case 1:
                 cmd.type = CMD_MATRIX_MULTIPLY; 
-                // 設定記憶體位址偏移量與維度 (需與 app.py 寫入的權重位置一致)
-                cmd.params[0] = 0;   // 矩陣 A 的起始索引
-                cmd.params[1] = 16;  // 矩陣 B 的起始索引 (偏移 16 個 float)
-                cmd.params[2] = 32;  // 結果矩陣 C 的寫入索引
-                cmd.params[3] = 4;   // 矩陣維度 N=4 (4x4 矩陣)
+                cmd.params[0] = 0;   
+                cmd.params[1] = 16;  
+                cmd.params[2] = 32;  
+                cmd.params[3] = 4;   
                 
                 std::cout << "[Driver Client] Submitting CMD_MATRIX_MULTIPLY..." << std::endl;
                 send_command(cmd);

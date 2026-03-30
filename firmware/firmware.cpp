@@ -100,8 +100,6 @@ void tcp_server_thread(vnpu_shared_state* npu) {
             } else if (mode == 1) {
                 uint32_t offset, size_in_bytes;
                 if (recv_all(client, (uint8_t*)&offset, 4) && recv_all(client, (uint8_t*)&size_in_bytes, 4)) {
-                    
-                    // 修正：防止整數溢位造成越界寫入
                     uint32_t max_bytes = NPU_MEM_SIZE * sizeof(float);
                     if (size_in_bytes <= max_bytes && offset <= (max_bytes - size_in_bytes)) {
                         recv_all(client, (uint8_t*)npu->npu_mem + offset, size_in_bytes);
@@ -121,7 +119,9 @@ void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
             uint32_t offA = cmd.params[0], offB = cmd.params[1], offC = cmd.params[2];
             uint32_t dim = cmd.params[3]; 
             
-            if ((offA + dim*dim > NPU_MEM_SIZE) || (offB + dim*dim > NPU_MEM_SIZE) || (offC + dim*dim > NPU_MEM_SIZE)) {
+            // 修復：強制轉型 uint64_t 避免惡意維度導致的整數溢位
+            uint64_t req_space = (uint64_t)dim * dim;
+            if ((offA + req_space > NPU_MEM_SIZE) || (offB + req_space > NPU_MEM_SIZE) || (offC + req_space > NPU_MEM_SIZE)) {
                 LOG_ERROR("CMD_MATRIX_MULTIPLY bounds check failed", LOG_FILE, TAG);
                 break;
             }
@@ -142,6 +142,10 @@ void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
             npu->temperature += 1.5f; 
             break;
         }
+        case CMD_CHECKSUM: { 
+            LOG_INFO("Processing CMD_CHECKSUM (Hardware Simulation)", LOG_FILE, TAG);
+            break;
+        }
         case CMD_HANG: {
             LOG_ERROR("Executing CMD_HANG - Triggering intentional SIGSEGV", LOG_FILE, TAG);
             volatile int* bad_ptr = nullptr;
@@ -152,6 +156,9 @@ void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
 }
 
 int main() {
+    
+    signal(SIGPIPE, SIG_IGN);
+
     struct sigaction sa;
     sa.sa_flags = SA_SIGINFO;
     sa.sa_sigaction = crash_handler;
@@ -168,7 +175,6 @@ int main() {
         mmap(nullptr, sizeof(vnpu_shared_state), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
     );
     
-    // 修正：檢查 mmap 是否成功，避免對 MAP_FAILED 進行操作
     if (npu == MAP_FAILED) {
         LOG_FATAL("mmap failed", LOG_FILE, TAG);
         close(fd);

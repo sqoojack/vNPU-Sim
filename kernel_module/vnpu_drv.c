@@ -5,6 +5,7 @@
 #include <linux/cdev.h>
 #include <linux/eventfd.h>
 #include <linux/spinlock.h>
+#include <linux/vmalloc.h> 
 #include "../include/vnpu_common.h"
 
 #define DEVICE_NAME "vnpu0"
@@ -14,15 +15,14 @@ static struct cdev vnpu_cdev;
 static struct vnpu_shared_state *shared_mem;
 static struct eventfd_ctx *irq_ctx = NULL;
 
-// 增加 spinlock 保護 Ring Buffer
 static DEFINE_SPINLOCK(ring_lock);
 
 static int vnpu_mmap(struct file *filp, struct vm_area_struct *vma) {
     unsigned long size = vma->vm_end - vma->vm_start;
     
-    if (size > sizeof(struct vnpu_shared_state)) return -EINVAL;
+    // 修復：vma 大小會對齊至分頁，因此檢查條件必須使用 PAGE_ALIGN
+    if (size > PAGE_ALIGN(sizeof(struct vnpu_shared_state))) return -EINVAL;
     
-    // 修正 mmap：改用 remap_vmalloc_range
     if (remap_vmalloc_range(vma, shared_mem, 0)) {
         return -EAGAIN;
     }
@@ -38,7 +38,6 @@ static long vnpu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
             if (copy_from_user(&user_cmd, (struct vnpu_command __user *)arg, sizeof(user_cmd)))
                 return -EFAULT;
 
-            // 修正：加入併發保護
             spin_lock(&ring_lock);
             
             next_tail = (shared_mem->tail + 1) % RING_BUFFER_SIZE;
@@ -58,7 +57,6 @@ static long vnpu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
             break;
 
         case VNPU_IOCTL_SET_EVENTFD:
-            // 修正：釋放舊有的 eventfd_ctx 避免資源洩漏
             if (irq_ctx) {
                 eventfd_ctx_put(irq_ctx);
             }
