@@ -19,10 +19,15 @@ CMD_MATRIX_MULTIPLY = 5
 VNPU_IOCTL_SUBMIT_CMD = (1 << 30) | (24 << 16) | (VNPU_MAGIC << 8) | 1
 
 def check_firmware_alive():
-    """檢查 Firmware Port 是否開啟"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(1.0)
-        return s.connect_ex((SERVER_IP, SERVER_PORT)) == 0
+        if s.connect_ex((SERVER_IP, SERVER_PORT)) == 0:
+            try:
+                s.sendall(struct.pack('<B', 99))
+            except Exception:
+                pass
+            return True
+        return False
 
 def send_weights(offset, matrix):
     data_bytes = matrix.astype(np.float32).tobytes()
