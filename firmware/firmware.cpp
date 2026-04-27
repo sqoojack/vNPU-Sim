@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fstream>
 #include <ucontext.h>
+#include <chrono>
 #include "vnpu_common.h" 
 #include "vnpu_logger.h"
 
@@ -52,6 +53,14 @@ void crash_handler(int sig, siginfo_t *info, void *context) {
     
     LOG_FATAL("SIGSEGV captured. Wrote crash_report.txt and crash_dump.bin", LOG_FILE, TAG);
     _exit(1);
+}
+
+void watchdog_thread(vnpu_shared_state* npu) {
+    while (npu->running) {
+        auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        npu->last_heartbeat = (uint64_t)now;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
 }
 
 bool recv_all(int socket, uint8_t* buffer, size_t length) {
@@ -119,7 +128,6 @@ void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
             uint32_t offA = cmd.params[0], offB = cmd.params[1], offC = cmd.params[2];
             uint32_t dim = cmd.params[3]; 
             
-            // 修復：強制轉型 uint64_t 避免惡意維度導致的整數溢位
             uint64_t req_space = (uint64_t)dim * dim;
             if ((offA + req_space > NPU_MEM_SIZE) || (offB + req_space > NPU_MEM_SIZE) || (offC + req_space > NPU_MEM_SIZE)) {
                 LOG_ERROR("CMD_MATRIX_MULTIPLY bounds check failed", LOG_FILE, TAG);
@@ -156,7 +164,6 @@ void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
 }
 
 int main() {
-    
     signal(SIGPIPE, SIG_IGN);
 
     struct sigaction sa;
@@ -191,6 +198,9 @@ int main() {
     
     std::thread net_thread(tcp_server_thread, npu);
     net_thread.detach();
+
+    std::thread wd_thread(watchdog_thread, npu);
+    wd_thread.detach();
 
     std::atomic<uint32_t>* head = reinterpret_cast<std::atomic<uint32_t>*>(&npu->head);
     std::atomic<uint32_t>* tail = reinterpret_cast<std::atomic<uint32_t>*>(&npu->tail);
