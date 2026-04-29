@@ -88,6 +88,39 @@ def submit_command(cmd_type, p0=0, p1=0, p2=0, p3=0, p4=0):
     except Exception as e:
         return f"IOCTL Error: {e}"
 
+# Wait for Firmware to finish execution to prevent reading stale data
+def wait_for_idle(timeout=5.0):
+    mm = get_shared_mmap()
+    if not mm: 
+        return False
+    
+    offset_head = HEADER_SIZE + NPU_MEM_BYTES + L1_CACHE_BYTES
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        mm.seek(offset_head)
+        head = struct.unpack('<I', mm.read(4))[0]
+        tail = struct.unpack('<I', mm.read(4))[0]
+        if head == tail: 
+            mm.close()
+            return True
+        time.sleep(0.05)
+        
+    mm.close()
+    return False
+
+# Fetch the current VRAM image
+def fetch_vram_image():
+    mm = get_shared_mmap()
+    if mm:
+        mm.seek(HEADER_SIZE)
+        raw_data = mm.read(NPU_MEM_BYTES)
+        npu_mem_raw = np.frombuffer(raw_data, dtype=np.float32)
+        img = npu_mem_raw.reshape((480, 640)).astype(np.uint8)
+        mm.close()
+        return img
+    return None
+
 st.set_page_config(page_title="vNPU Simulator", layout="wide")
 st.title("vNPU-Sim System Monitoring Dashboard")
 
@@ -97,7 +130,7 @@ if not is_alive:
     perform_watchdog_recovery()
     st.rerun()
 else:
-    st.success("Firmware online")
+    st.success("Firmware online and ready.")
 
 tab1, tab2, tab3, tab4 = st.tabs(["Architecture & Comm", "GPU Sim (VRAM)", "NPU Sim (GEMM)", "System Diagnostics"])
 
@@ -118,37 +151,43 @@ with tab1:
 
 with tab2:
     st.subheader("GPU Simulation: 2D Memory Manipulation")
+    st.markdown("**Verification Method**: Send a drawing command here, the system will wait for the firmware to process it in the background, and then immediately fetch the VRAM memory to prove the image has been correctly rendered by the hardware.")
+    
     colA, colB = st.columns(2)
     with colA:
-        clear_color = st.number_input("Clear Color (0-255)", 0, 255, 0)
-        if st.button("CMD_CLEAR (Clear VRAM)"):
-            res = submit_command(CMD_CLEAR, p0=clear_color)
-            st.success(res)
+        with st.expander("1. Clear VRAM", expanded=True):
+            clear_color = st.number_input("Clear Color (0-255)", 0, 255, 0)
+            if st.button("Execute CMD_CLEAR"):
+                res = submit_command(CMD_CLEAR, p0=clear_color)
+                wait_for_idle() 
+                st.success(f"{res} - VRAM Cleared!")
+                st.session_state['vram_updated'] = True
+                
+        with st.expander("2. Draw Rectangle", expanded=True):
+            rect_x = st.number_input("X", 0, 640, 100)
+            rect_y = st.number_input("Y", 0, 480, 100)
+            rect_w = st.number_input("Width", 1, 640, 200)
+            rect_h = st.number_input("Height", 1, 480, 150)
+            rect_color = st.number_input("Color (0-255)", 0, 255, 255)
             
-        st.markdown("---")
-        rect_x = st.number_input("X", 0, 640, 100)
-        rect_y = st.number_input("Y", 0, 480, 100)
-        rect_w = st.number_input("Width", 1, 640, 200)
-        rect_h = st.number_input("Height", 1, 480, 150)
-        rect_color = st.number_input("Color (0-255)", 0, 255, 255)
-        
-        if st.button("CMD_DRAW_RECT (Render)"):
-            res = submit_command(CMD_DRAW_RECT, p0=rect_x, p1=rect_y, p2=rect_w, p3=rect_h, p4=rect_color)
-            st.success(res)
+            if st.button("Execute CMD_DRAW_RECT"):
+                res = submit_command(CMD_DRAW_RECT, p0=rect_x, p1=rect_y, p2=rect_w, p3=rect_h, p4=rect_color)
+                wait_for_idle() 
+                st.success(f"{res} - Rectangle Rendered!")
+                st.session_state['vram_updated'] = True
 
     with colB:
-        st.write("VRAM Buffer Visualization")
-        if st.button("Fetch VRAM Frame"):
-            mm = get_shared_mmap()
-            if mm:
-                mm.seek(HEADER_SIZE)
-                raw_data = mm.read(NPU_MEM_BYTES)
-                npu_mem_raw = np.frombuffer(raw_data, dtype=np.float32)
-                img = npu_mem_raw.reshape((480, 640)).astype(np.uint8)
-                st.image(img, caption="640x480 VRAM View")
-                mm.close()
+        st.write("### VRAM Buffer Live View")
+        if st.button("Manual Refresh View") or st.session_state.get('vram_updated', False):
+            st.session_state['vram_updated'] = False
+            img = fetch_vram_image()
+            if img is not None:
+                st.image(img, caption="640x480 VRAM View (Direct Memory Mapping)", use_column_width=True)
 
 with tab3:
+    st.subheader("NPU Simulation: Matrix Multiplication (GEMM)")
+    st.markdown("**Verification Method**: This will automatically load the matrices into shared memory, trigger the NPU computation, read back the results, and compare them with the standard NumPy answer. If they match, the hardware logic simulation is successful!")
+    
     dim = st.number_input("Matrix Dimension", min_value=2, max_value=256, value=64, step=1)
     if "current_dim" not in st.session_state or st.session_state.current_dim != dim:
         st.session_state.current_dim = dim
@@ -157,58 +196,69 @@ with tab3:
 
     col1, col2 = st.columns(2)
     with col1:
-        st.write("Matrix A")
+        st.write("Input Matrix A (CPU Memory)")
         st.dataframe(st.session_state.mat_A, height=150)
     with col2:
-        st.write("Matrix B")
+        st.write("Input Matrix B (CPU Memory)")
         st.dataframe(st.session_state.mat_B, height=150)
 
-    if st.button("Push Weights (Zero-Copy)"):
+    st.markdown("---")
+    if st.button("Run Full NPU GEMM Pipeline & Verify", type="primary"):
         send_weights(0, st.session_state.mat_A)
         send_weights(dim * dim, st.session_state.mat_B)
-        st.success("Memory updated via mmap")
-
-    if st.button("CMD_MATRIX_MULTIPLY (Execute)"):
-        res = submit_command(CMD_MATRIX_MULTIPLY, p0=0, p1=dim*dim, p2=dim*dim*2, p3=dim)
-        st.code(res)
-
-    if st.button("Pull GEMM Results"):
-        mm = get_shared_mmap()
-        if mm:
-            offset_c = dim * dim * 2
-            byte_offset = HEADER_SIZE + (offset_c * 4)
-            mm.seek(byte_offset)
-            raw_data = mm.read(dim * dim * 4)
-            mat_C = np.frombuffer(raw_data, dtype=np.float32).reshape(dim, dim)
+        
+        submit_command(CMD_MATRIX_MULTIPLY, p0=0, p1=dim*dim, p2=dim*dim*2, p3=dim)
+        
+        with st.spinner("Wait for NPU Hardware processing..."):
+            is_done = wait_for_idle()
             
-            expected_C = np.dot(st.session_state.mat_A, st.session_state.mat_B)
-            mse = ((mat_C - expected_C)**2).mean()
-            st.dataframe(mat_C, height=150)
-            st.metric("Mean Squared Error (MSE)", f"{mse:.8f}")
-            mm.close()
+        if is_done:
+            mm = get_shared_mmap()
+            if mm:
+                offset_c = dim * dim * 2
+                byte_offset = HEADER_SIZE + (offset_c * 4)
+                mm.seek(byte_offset)
+                raw_data = mm.read(dim * dim * 4)
+                mat_C = np.frombuffer(raw_data, dtype=np.float32).reshape(dim, dim)
+                mm.close()
+                
+                expected_C = np.dot(st.session_state.mat_A, st.session_state.mat_B)
+                mse = ((mat_C - expected_C)**2).mean()
+                
+                st.write("### NPU Computation Result (Read from VRAM)")
+                st.dataframe(mat_C, height=150)
+                
+                if mse < 1e-4:
+                    st.success(f"Hardware Simulation Verification Successful! The NPU result perfectly matches the CPU standard answer (MSE: {mse:.8f})")
+                else:
+                    st.error(f"Verification Failed! The NPU result does not match the expectation (MSE: {mse:.8f})")
+        else:
+            st.error("NPU Execution Timeout!")
 
 with tab4:
     st.subheader("Hardware Testing & Diagnostics")
     c1, c2 = st.columns(2)
     with c1:
+        st.write("Memory Diagnostics")
         chk_offset = st.number_input("Checksum Offset", 0, NPU_MEM_SIZE, 0)
         chk_size = st.number_input("Checksum Size", 1, NPU_MEM_SIZE, 1024)
         chk_dest = st.number_input("Checksum Result Dest Offset", 0, NPU_MEM_SIZE, NPU_MEM_SIZE-1)
         if st.button("CMD_CHECKSUM"):
             res = submit_command(CMD_CHECKSUM, p0=chk_offset, p1=chk_size, p2=chk_dest)
+            wait_for_idle()
             st.success(res)
             
-        if st.button("Read Checksum Result"):
             mm = get_shared_mmap()
             if mm:
                 byte_offset = HEADER_SIZE + (chk_dest * 4)
                 mm.seek(byte_offset)
                 val = struct.unpack('<f', mm.read(4))[0]
-                st.info(f"Value at offset {chk_dest}: {val}")
+                st.info(f"Checksum Result at offset {chk_dest}: {val}")
                 mm.close()
 
     with c2:
         st.write("Fault Injection")
-        if st.button("CMD_HANG (Trigger Crash)"):
+        if st.button("CMD_HANG (Trigger Kernel Crash/Watchdog)"):
             res = submit_command(CMD_HANG)
-            st.error(res)
+            st.error(f"Sent Fault Command: {res}")
+            st.warning("Please wait a few seconds for the watchdog to recover the system...")
