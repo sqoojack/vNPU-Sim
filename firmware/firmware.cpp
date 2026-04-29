@@ -118,8 +118,16 @@ void tcp_server_thread(vnpu_shared_state* npu) {
                     if (size_in_bytes <= max_bytes && offset <= (max_bytes - size_in_bytes)) {
                         recv_all(client, (uint8_t*)npu->npu_mem + offset, size_in_bytes);
                     } else {
-                        LOG_ERROR("TCP Write blocked: Out of bounds or Integer Overflow", LOG_FILE, TAG);
+                        LOG_ERROR("TCP Write blocked: Out of bounds", LOG_FILE, TAG);
                     }
+                }
+            } else if (mode == 2) {
+                uint32_t command_id;
+                if (recv_all(client, (uint8_t*)&command_id, 4)) {
+                    char response[64];
+                    snprintf(response, sizeof(response), "Firmware ACK cmd: %u", command_id);
+                    send_all(client, (const uint8_t*)response, strlen(response));
+                    LOG_INFO("Diag command executed", LOG_FILE, TAG);
                 }
             }
         }
@@ -129,6 +137,46 @@ void tcp_server_thread(vnpu_shared_state* npu) {
 
 void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
     switch (cmd.type) {
+        case CMD_CLEAR: {
+            uint32_t color = cmd.params[0];
+            for (uint32_t i = 0; i < NPU_MEM_SIZE; ++i) {
+                npu->npu_mem[i] = (float)color;
+            }
+            LOG_INFO("Processed CMD_CLEAR", LOG_FILE, TAG);
+            break;
+        }
+        case CMD_DRAW_RECT: {
+            uint32_t x = cmd.params[0];
+            uint32_t y = cmd.params[1];
+            uint32_t w = cmd.params[2];
+            uint32_t h = cmd.params[3];
+            uint32_t color = cmd.params[4]; 
+            
+            for (uint32_t r = y; r < y + h && r < 480; ++r) {
+                for (uint32_t c = x; c < x + w && c < 640; ++c) {
+                    npu->npu_mem[r * 640 + c] = (float)color;
+                }
+            }
+            LOG_INFO("Processed CMD_DRAW_RECT (GPU Sim)", LOG_FILE, TAG);
+            break;
+        }
+        case CMD_CHECKSUM: { 
+            uint32_t offset = cmd.params[0];
+            uint32_t size = cmd.params[1];
+            uint32_t dest_offset = cmd.params[2];
+            
+            if (offset + size <= NPU_MEM_SIZE && dest_offset < NPU_MEM_SIZE) {
+                uint32_t sum = 0;
+                for (uint32_t i = offset; i < offset + size; ++i) {
+                    sum += (uint32_t)npu->npu_mem[i];
+                }
+                npu->npu_mem[dest_offset] = (float)sum;
+                LOG_INFO("Processed CMD_CHECKSUM", LOG_FILE, TAG);
+            } else {
+                LOG_ERROR("CMD_CHECKSUM bounds check failed", LOG_FILE, TAG);
+            }
+            break;
+        }
         case CMD_MATRIX_MULTIPLY: {
             uint32_t offA = cmd.params[0], offB = cmd.params[1], offC = cmd.params[2];
             uint32_t dim = cmd.params[3]; 
@@ -155,8 +203,14 @@ void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
             npu->temperature += 1.5f; 
             break;
         }
-        case CMD_CHECKSUM: { 
-            LOG_INFO("Processing CMD_CHECKSUM (Hardware Simulation)", LOG_FILE, TAG);
+        case CMD_VECTOR_ADD: {
+            uint32_t offA = cmd.params[0], offB = cmd.params[1], offC = cmd.params[2];
+            uint32_t len = cmd.params[3];
+            float* A = &npu->npu_mem[offA];
+            float* B = &npu->npu_mem[offB];
+            float* C = &npu->npu_mem[offC];
+            for(uint32_t i = 0; i < len; ++i) C[i] = A[i] + B[i];
+            LOG_INFO("Processed GPU Vector Add", LOG_FILE, TAG);
             break;
         }
         case CMD_HANG: {
@@ -197,7 +251,7 @@ int main() {
 
     if (npu->last_heartbeat != 0) {
         npu->watchdog_reset_count += 1;
-        LOG_INFO("Recovered from crash. Watchdog reset count incremented.", LOG_FILE, TAG);
+        LOG_INFO("Recovered from crash.", LOG_FILE, TAG);
     } else {
         npu->temperature = 37.0f;
         npu->watchdog_reset_count = 0;

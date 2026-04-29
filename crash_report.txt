@@ -1,0 +1,9 @@
+=== FATAL: Hardware Fault Detected ===
+Signal Number: 11
+Faulting Memory Address: 0
+RIP: 0x59065aa38ca4
+RSP: 0x7ffe0078e330
+RBP: 0x7ffe0078e410
+
+[Ring Buffer Snapshot]
+Head: 7 | Tail: 8

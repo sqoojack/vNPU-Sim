@@ -16,6 +16,7 @@ enum VNPUCommandType {
     CMD_DRAW_RECT = 2,
     CMD_CHECKSUM = 4,
     CMD_MATRIX_MULTIPLY = 5,
+    CMD_VECTOR_ADD = 6,
     CMD_HANG = 9
 };
 
@@ -24,15 +25,14 @@ struct vnpu_command {
     __u32 params[5]; 
 };
 
-// Force 32 Bytes Header to prevent Python parsing offset due to compiler behavior
 struct vnpu_shared_state {
-    __u32 magic;                 // 4 bytes
-    __u32 running;               // 4 bytes
-    __u32 frame_counter;         // 4 bytes
-    float temperature;           // 4 bytes
-    __u64 last_heartbeat;        // 8 bytes
-    __u32 watchdog_reset_count;  // 4 bytes
-    __u32 _padding;              // 4 bytes (Maintain 8-byte alignment)
+    __u32 magic;                 
+    __u32 running;               
+    __u32 frame_counter;         
+    float temperature;           
+    __u64 last_heartbeat;        
+    __u32 watchdog_reset_count;  
+    __u32 _padding;              
 
     float npu_mem[NPU_MEM_SIZE]; 
 
