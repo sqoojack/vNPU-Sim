@@ -4,10 +4,13 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <cstring>
+#include <sys/mman.h>
+#include <iomanip>
 #include "vnpu_common.h"
 
 int tenant_id = -1;
 int dev_fd = -1;
+vnpu_shared_state* global_npu = nullptr;
 
 void send_command(vnpu_command cmd) {
     
@@ -29,10 +32,34 @@ void send_command(vnpu_command cmd) {
     }
 }
 
+void print_vram_ascii() {
+    std::cout << "[Driver Client] VRAM 64x48 View (Scaled 10x10):" << std::endl;
+    for(int r = 0; r < 48; ++r) {
+        for(int c = 0; c < 64; ++c) {
+            float val = global_npu->npu_mem[(r * 10) * 640 + (c * 10)];
+            std::cout << (val > 0 ? "#" : ".");
+        }
+        std::cout << std::endl;
+    }
+}
+
+void print_matrix(int offset, int dim) {
+    std::cout << "[Driver Client] Matrix View (Offset: " << offset << "):" << std::endl;
+    for (int i = 0; i < dim; ++i) {
+        for (int j = 0; j < dim; ++j) {
+            std::cout << std::setw(6) << global_npu->npu_mem[offset + i * dim + j] << " ";
+        }
+        std::cout << std::endl;
+    }
+}
+
 void print_menu() {
     std::cout << "\n===== vNPU Driver Client (Tenant " << tenant_id << ") =====" << std::endl;
-    std::cout << "1. Trigger Matrix Multiply (4x4, A=0, B=16, C=32)" << std::endl;
+    std::cout << "1. Trigger Matrix Multiply (4x4) & Show Result" << std::endl;
     std::cout << "2. Test ARM64 Assembly (Checksum/Addition)" << std::endl;
+    std::cout << "3. Clear VRAM" << std::endl;
+    std::cout << "4. Draw Rectangle in VRAM" << std::endl;
+    std::cout << "5. Show VRAM ASCII Art" << std::endl;
     std::cout << "9. SIMULATE HANG (Test Crash Dump & Watchdog)" << std::endl;
     std::cout << "0. Exit" << std::endl;
     std::cout << "Select: ";
@@ -50,6 +77,12 @@ int main(int argc, char** argv) {
         std::cerr << "Error: Cannot open /dev/vnpu0. Is the Kernel Module loaded?" << std::endl; 
         return 1; 
     }
+
+    global_npu = static_cast<vnpu_shared_state*>(mmap(nullptr, sizeof(vnpu_shared_state), PROT_READ | PROT_WRITE, MAP_SHARED, dev_fd, 0));
+    if (global_npu == MAP_FAILED) {
+        std::cerr << "Error: mmap failed in client." << std::endl;
+        return 1;
+    }
     
     int choice;
     while (true) {
@@ -62,6 +95,9 @@ int main(int argc, char** argv) {
 
         switch(choice) {
             case 1:
+                for(int i=0; i<16; ++i) global_npu->npu_mem[0 + i] = (float)(i + 1);
+                for(int i=0; i<16; ++i) global_npu->npu_mem[16 + i] = 2.0f;
+                
                 cmd.type = CMD_MATRIX_MULTIPLY; 
                 cmd.params[0] = 0;   
                 cmd.params[1] = 16;  
@@ -70,12 +106,34 @@ int main(int argc, char** argv) {
                 
                 std::cout << "[Driver Client] Submitting CMD_MATRIX_MULTIPLY..." << std::endl;
                 send_command(cmd);
+                usleep(500000); 
+                print_matrix(32, 4);
+                std::cout << "[Driver Client] Hardware Temp increased to: " << global_npu->temperature << " C" << std::endl;
                 break;
             case 2:
                 cmd.type = CMD_CHECKSUM; 
                 cmd.params[0] = 100;
                 cmd.params[1] = 250;
                 send_command(cmd);
+                break;
+            case 3:
+                cmd.type = CMD_CLEAR;
+                cmd.params[0] = 0;
+                send_command(cmd);
+                std::cout << "[Driver Client] VRAM Cleared." << std::endl;
+                break;
+            case 4:
+                cmd.type = CMD_DRAW_RECT;
+                cmd.params[0] = 100; 
+                cmd.params[1] = 100; 
+                cmd.params[2] = 400; 
+                cmd.params[3] = 200; 
+                cmd.params[4] = 255; 
+                send_command(cmd);
+                std::cout << "[Driver Client] Rectangle command sent." << std::endl;
+                break;
+            case 5:
+                print_vram_ascii();
                 break;
             case 9:
                 cmd.type = CMD_HANG; 
