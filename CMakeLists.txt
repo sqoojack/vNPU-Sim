@@ -4,7 +4,7 @@ project(vNPUSimulator VERSION 1.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-# 加入安全編譯選項
+# Add secure compilation options
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Werror -Wpedantic -fno-omit-frame-pointer")
 
 include(FetchContent)
@@ -15,7 +15,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(googletest)
 
-# 修正路徑 src/ -> common/
+# Fix path src/ -> common/
 add_library(vnpu_utils common/vnpu_logger.cpp)
 target_include_directories(vnpu_utils PUBLIC ${CMAKE_SOURCE_DIR}/include)
 

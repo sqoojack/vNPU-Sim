@@ -24,7 +24,7 @@ struct vnpu_command {
     __u32 params[5]; 
 };
 
-// 強制 32 Bytes Header，避免編譯器行為導致 Python 解析偏移
+// Force 32 Bytes Header to prevent Python parsing offset due to compiler behavior
 struct vnpu_shared_state {
     __u32 magic;                 // 4 bytes
     __u32 running;               // 4 bytes
@@ -32,7 +32,7 @@ struct vnpu_shared_state {
     float temperature;           // 4 bytes
     __u64 last_heartbeat;        // 8 bytes
     __u32 watchdog_reset_count;  // 4 bytes
-    __u32 _padding;              // 4 bytes (維持 8-byte alignment)
+    __u32 _padding;              // 4 bytes (Maintain 8-byte alignment)
 
     float npu_mem[NPU_MEM_SIZE]; 
 

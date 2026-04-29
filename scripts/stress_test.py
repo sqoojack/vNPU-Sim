@@ -20,7 +20,7 @@ def run_stress_test():
     
     print("[TEST] Starting Command Flood (1000 commands)...")
     
-    # 修復：將指令提高至 1000 個，強制超越 Ring Buffer 長度 (256) 徹底激發並驗證滿載行為
+    # Fix: Increase commands to 1000, force exceeding Ring Buffer size (256) to verify backpressure behavior under full load
     input_cmds = "1\n" * 1000 + "0\n"
     
     try:

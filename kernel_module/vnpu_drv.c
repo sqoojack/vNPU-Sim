@@ -23,7 +23,7 @@ static DEFINE_SPINLOCK(ring_lock);
 static int vnpu_mmap(struct file *filp, struct vm_area_struct *vma) {
     unsigned long size = vma->vm_end - vma->vm_start;
     
-    // 修復：vma 大小會對齊至分頁，因此檢查條件必須使用 PAGE_ALIGN
+    // Fix: VMA size is page-aligned, so the check condition must use PAGE_ALIGN
     if (size > PAGE_ALIGN(sizeof(struct vnpu_shared_state))) return -EINVAL;
     
     if (remap_vmalloc_range(vma, shared_mem, 0)) {

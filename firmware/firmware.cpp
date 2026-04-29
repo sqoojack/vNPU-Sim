@@ -59,6 +59,11 @@ void watchdog_thread(vnpu_shared_state* npu) {
     while (npu->running) {
         auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
         npu->last_heartbeat = (uint64_t)now;
+        
+        if (npu->temperature > 37.0f) {
+            npu->temperature -= 0.5f;
+        }
+        
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
@@ -190,10 +195,17 @@ int main() {
     
     global_npu_ptr = npu;
 
+    if (npu->last_heartbeat != 0) {
+        npu->watchdog_reset_count += 1;
+        LOG_INFO("Recovered from crash. Watchdog reset count incremented.", LOG_FILE, TAG);
+    } else {
+        npu->temperature = 37.0f;
+        npu->watchdog_reset_count = 0;
+    }
+
     int irq_fd = eventfd(0, EFD_NONBLOCK);
     ioctl(fd, VNPU_IOCTL_SET_EVENTFD, irq_fd);
 
-    npu->temperature = 37.0f;
     npu->running = 1;
     
     std::thread net_thread(tcp_server_thread, npu);
