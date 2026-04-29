@@ -12,6 +12,8 @@
 #include <fstream>
 #include <ucontext.h>
 #include <chrono>
+#include <list>
+#include <unordered_map>
 #include "vnpu_common.h" 
 #include "vnpu_logger.h"
 
@@ -22,8 +24,149 @@ const uint64_t LATENCY_ALU = 1;
 const uint64_t LATENCY_L1_HIT = 2;
 const uint64_t LATENCY_DRAM_ACCESS = 100;
 
+#define WARP_SIZE 4       // Simulate 4 threads per warp (SIMT)
+#define NUM_REGISTERS 16  // 16 general purpose registers per thread
+
 vnpu_shared_state* global_npu_ptr = nullptr;
 
+// ==========================================
+// 1. Memory Hierarchy: LRU Cache Simulator
+// ==========================================
+class LRUCache {
+private:
+    size_t capacity;
+    std::list<uint32_t> lru_list; 
+    std::unordered_map<uint32_t, std::list<uint32_t>::iterator> cache_map;
+
+public:
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+
+    LRUCache(size_t cap) : capacity(cap) {}
+
+    // Simulates memory access and returns latency in cycles
+    uint64_t access(uint32_t address) {
+        uint32_t cache_line = address / 64; // Assume 64-byte cache line
+        
+        if (cache_map.find(cache_line) != cache_map.end()) {
+            // Cache Hit: Move to front of LRU list
+            lru_list.erase(cache_map[cache_line]);
+            lru_list.push_front(cache_line);
+            cache_map[cache_line] = lru_list.begin();
+            hits++;
+            return LATENCY_L1_HIT;
+        } else {
+            // Cache Miss: Fetch from DRAM
+            if (lru_list.size() >= capacity) {
+                uint32_t lru = lru_list.back();
+                lru_list.pop_back();
+                cache_map.erase(lru);
+            }
+            lru_list.push_front(cache_line);
+            cache_map[cache_line] = lru_list.begin();
+            misses++;
+            return LATENCY_DRAM_ACCESS;
+        }
+    }
+};
+
+// ==========================================
+// 2. Thread Scheduling: SIMT Warp Context
+// ==========================================
+struct Warp {
+    int warp_id;
+    uint32_t pc; // Program Counter
+    bool is_active;
+    
+    // Register File: Each thread in the warp has its own registers
+    float registers[WARP_SIZE][NUM_REGISTERS]; 
+
+    Warp(int id) : warp_id(id), pc(0), is_active(true) {
+        memset(registers, 0, sizeof(registers));
+    }
+};
+
+// ==========================================
+// 3. Instruction Execution Engine
+// ==========================================
+void execute_npu_program(vnpu_shared_state* npu, uint32_t prog_offset) {
+    LRUCache l1_cache(128); // 128 cache lines
+    std::vector<Warp> sm_warps;
+    
+    // Initialize 1 Warp for this test simulation
+    Warp w0(0);
+    w0.pc = prog_offset; 
+    sm_warps.push_back(w0);
+
+    bool sm_running = true;
+    
+    while (sm_running) {
+        sm_running = false;
+
+        for (auto& warp : sm_warps) {
+            if (!warp.is_active) continue;
+            sm_running = true; 
+
+            // [FETCH] Get instruction from memory using Program Counter (pc)
+            vNPU_Instruction* inst = reinterpret_cast<vNPU_Instruction*>(&npu->npu_mem[warp.pc]);
+
+            // [DECODE & EXECUTE]
+            switch (inst->opcode) {
+                case OP_LOAD: {
+                    // Get memory address from the source register of thread 0
+                    uint32_t mem_addr = (uint32_t)warp.registers[0][inst->src_reg1]; 
+                    uint64_t latency = l1_cache.access(mem_addr);
+                    npu->total_cycles += latency;
+                    
+                    // SIMT: All threads in the warp load contiguous data concurrently
+                    for (int t = 0; t < WARP_SIZE; ++t) {
+                        warp.registers[t][inst->dest_reg] = npu->npu_mem[mem_addr + t];
+                    }
+                    warp.pc++; 
+                    break;
+                }
+                case OP_STORE: {
+                    uint32_t mem_addr = (uint32_t)warp.registers[0][inst->dest_reg]; 
+                    uint64_t latency = l1_cache.access(mem_addr);
+                    npu->total_cycles += latency;
+                    
+                    // SIMT: All threads store data concurrently
+                    for (int t = 0; t < WARP_SIZE; ++t) {
+                        npu->npu_mem[mem_addr + t] = warp.registers[t][inst->src_reg1];
+                    }
+                    warp.pc++; 
+                    break;
+                }
+                case OP_ADD: {
+                    for (int t = 0; t < WARP_SIZE; ++t) {
+                        warp.registers[t][inst->dest_reg] = 
+                            warp.registers[t][inst->src_reg1] + warp.registers[t][inst->src_reg2];
+                    }
+                    npu->total_cycles += LATENCY_ALU; 
+                    warp.pc++;
+                    break;
+                }
+                case OP_HALT: {
+                    warp.is_active = false; 
+                    break;
+                }
+                default: {
+                    LOG_ERROR("Unknown Instruction Opcode", LOG_FILE, TAG);
+                    warp.is_active = false;
+                    break;
+                }
+            }
+        }
+    }
+    
+    std::string stats = "Execution Finished. Cache Hits: " + std::to_string(l1_cache.hits) + 
+                        ", Misses: " + std::to_string(l1_cache.misses);
+    LOG_INFO(stats, LOG_FILE, TAG);
+}
+
+// ==========================================
+// Legacy Systems (Crash handler, Watchdog)
+// ==========================================
 void crash_handler(int sig, siginfo_t *info, void *context) {
     if (!global_npu_ptr) _exit(1);
     
@@ -71,10 +214,19 @@ void watchdog_thread(vnpu_shared_state* npu) {
     }
 }
 
+// ==========================================
+// Command Router
+// ==========================================
 void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
     uint64_t cycles_spent = 0;
 
     switch (cmd.type) {
+        case CMD_EXEC_PROGRAM: {
+            uint32_t prog_offset = cmd.params[0];
+            LOG_INFO("Processing Custom ISA Program at offset " + std::to_string(prog_offset), LOG_FILE, TAG);
+            execute_npu_program(npu, prog_offset);
+            break;
+        }
         case CMD_CLEAR: {
             uint32_t color = cmd.params[0];
             for (uint32_t i = 0; i < NPU_MEM_SIZE; ++i) {
@@ -157,7 +309,7 @@ void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
             cycles_spent /= num_threads; 
             
             npu->temperature += 1.5f; 
-            LOG_INFO("Processed CMD_MATRIX_MULTIPLY with parallel workers", LOG_FILE, TAG);
+            LOG_INFO("Processed CMD_MATRIX_MULTIPLY", LOG_FILE, TAG);
             break;
         }
         case CMD_MEM_TRANSFER: {
@@ -236,6 +388,8 @@ int main() {
     std::atomic<uint32_t>* head = reinterpret_cast<std::atomic<uint32_t>*>(&npu->head);
     std::atomic<uint32_t>* tail = reinterpret_cast<std::atomic<uint32_t>*>(&npu->tail);
     uint64_t irq_count;
+
+    LOG_INFO("Firmware is running and waiting for commands...", LOG_FILE, TAG);
 
     while (npu->running) {
         if (read(irq_fd, &irq_count, sizeof(irq_count)) > 0) {

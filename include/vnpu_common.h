@@ -12,6 +12,23 @@
 #define L1_CACHE_SIZE 4096
 #define RING_BUFFER_SIZE 256
 
+// --- Micro-ISA Definitions (Custom NPU Instruction Set) ---
+enum vNPU_Opcode {
+    OP_LOAD  = 0x01, // Load data from memory to register
+    OP_STORE = 0x02, // Store data from register to memory
+    OP_ADD   = 0x03, // Add two registers: dest = src1 + src2
+    OP_MUL   = 0x04, // Multiply two registers: dest = src1 * src2
+    OP_HALT  = 0xFF  // Halt execution
+};
+
+// 32-bit Instruction Format
+struct vNPU_Instruction {
+    __u8 opcode;   
+    __u8 dest_reg; 
+    __u8 src_reg1; 
+    __u8 src_reg2; 
+};
+
 enum VNPUCommandType {
     CMD_CLEAR = 1,
     CMD_DRAW_RECT = 2,
@@ -19,7 +36,8 @@ enum VNPUCommandType {
     CMD_MATRIX_MULTIPLY = 5,
     CMD_VECTOR_ADD = 6,
     CMD_HANG = 9,
-    CMD_MEM_TRANSFER = 10 
+    CMD_MEM_TRANSFER = 10,
+    CMD_EXEC_PROGRAM = 11 // NEW: Execute custom NPU machine code
 };
 
 struct vnpu_command {
