@@ -9,6 +9,7 @@
 #define VNPU_IOCTL_SET_EVENTFD _IOW(VNPU_MAGIC, 2, int)
 
 #define NPU_MEM_SIZE (640 * 480) 
+#define L1_CACHE_SIZE 4096
 #define RING_BUFFER_SIZE 256
 
 enum VNPUCommandType {
@@ -17,11 +18,12 @@ enum VNPUCommandType {
     CMD_CHECKSUM = 4,
     CMD_MATRIX_MULTIPLY = 5,
     CMD_VECTOR_ADD = 6,
-    CMD_HANG = 9
+    CMD_HANG = 9,
+    CMD_MEM_TRANSFER = 10 
 };
 
 struct vnpu_command {
-    __u32 type;
+    __u32 type; 
     __u32 params[5]; 
 };
 
@@ -32,9 +34,10 @@ struct vnpu_shared_state {
     float temperature;           
     __u64 last_heartbeat;        
     __u32 watchdog_reset_count;  
-    __u32 _padding;              
-
+    __u64 total_cycles;          
+    
     float npu_mem[NPU_MEM_SIZE]; 
+    float l1_cache[L1_CACHE_SIZE]; 
 
     __u32 head; 
     __u32 tail; 

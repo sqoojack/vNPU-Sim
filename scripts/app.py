@@ -1,4 +1,3 @@
-import socket
 import struct
 import numpy as np
 import streamlit as st
@@ -6,13 +5,19 @@ import fcntl
 import os
 import time
 import subprocess
+import mmap
 
-SERVER_IP = '127.0.0.1'
-SERVER_PORT = 8080
-HEADER_SIZE = 32
 NPU_MEM_SIZE = 640 * 480
+L1_CACHE_SIZE = 4096
+RING_BUFFER_SIZE = 256
 NPU_MEM_BYTES = NPU_MEM_SIZE * 4
-TOTAL_STATE_SIZE = HEADER_SIZE + NPU_MEM_BYTES + 8 + (256 * 24) 
+L1_CACHE_BYTES = L1_CACHE_SIZE * 4
+
+HEADER_SIZE = 40
+TOTAL_STATE_SIZE = HEADER_SIZE + NPU_MEM_BYTES + L1_CACHE_BYTES + 8 + (RING_BUFFER_SIZE * 24)
+
+PAGE_SIZE = 4096
+MMAP_SIZE = ((TOTAL_STATE_SIZE + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
 
 VNPU_MAGIC = ord('V')
 CMD_CLEAR = 1
@@ -23,16 +28,38 @@ CMD_VECTOR_ADD = 6
 CMD_HANG = 9
 VNPU_IOCTL_SUBMIT_CMD = (1 << 30) | (24 << 16) | (VNPU_MAGIC << 8) | 1
 
+def get_shared_mmap():
+    if not os.path.exists("/dev/vnpu0"):
+        return None
+    fd = os.open("/dev/vnpu0", os.O_RDWR | os.O_SYNC)
+    try:
+        mm = mmap.mmap(fd, MMAP_SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        return mm
+    except Exception as e:
+        st.error(f"Failed to mmap: {e}")
+        return None
+    finally:
+        os.close(fd)
+
 def check_firmware_alive():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(1.0)
-        if s.connect_ex((SERVER_IP, SERVER_PORT)) == 0:
-            try:
-                s.sendall(struct.pack('<B', 99))
-            except Exception:
-                pass
-            return True
+    mm = get_shared_mmap()
+    if mm is None:
         return False
+    
+    mm.seek(4)
+    running = struct.unpack('<I', mm.read(4))[0]
+    if running == 0:
+        mm.close()
+        return False
+        
+    mm.seek(16)
+    last_hb = struct.unpack('<Q', mm.read(8))[0]
+    mm.close()
+    
+    current_time = int(time.time())
+    if current_time - last_hb > 3:
+        return False
+    return True
 
 def perform_watchdog_recovery():
     subprocess.run(["pkill", "-f", "./build/firmware"])
@@ -40,38 +67,15 @@ def perform_watchdog_recovery():
     subprocess.Popen(["./build/firmware"])
     time.sleep(2)
 
-def send_weights(offset, matrix):
+def send_weights(offset_in_floats, matrix):
+    mm = get_shared_mmap()
+    if mm is None:
+        return
     data_bytes = matrix.astype(np.float32).tobytes()
-    size_in_bytes = len(data_bytes)
-    
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(5.0)
-        s.connect((SERVER_IP, SERVER_PORT))
-        s.sendall(struct.pack('<B I I', 1, offset, size_in_bytes))
-        s.sendall(data_bytes)
-
-def send_diagnostic_command(cmd_id):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(5.0)
-        s.connect((SERVER_IP, SERVER_PORT))
-        s.sendall(struct.pack('<B I', 2, cmd_id))
-        response = s.recv(1024)
-        return response.decode('utf-8')
-
-def read_npu_state():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(10.0)
-        s.connect((SERVER_IP, SERVER_PORT))
-        s.sendall(struct.pack('<B', 0))
-        
-        data = bytearray()
-        while len(data) < TOTAL_STATE_SIZE:
-            packet = s.recv(65536)
-            if not packet:
-                break
-            data.extend(packet)
-            
-        return bytes(data)
+    byte_offset = HEADER_SIZE + (offset_in_floats * 4)
+    mm.seek(byte_offset)
+    mm.write(data_bytes)
+    mm.close()
 
 def submit_command(cmd_type, p0=0, p1=0, p2=0, p3=0, p4=0):
     cmd_bytes = struct.pack('<I 5I', cmd_type, p0, p1, p2, p3, p4)
@@ -100,22 +104,17 @@ tab1, tab2, tab3, tab4 = st.tabs(["Architecture & Comm", "GPU Sim (VRAM)", "NPU 
 with tab1:
     st.subheader("Communication Architecture")
     st.markdown("""
-    This system implements two distinct communication planes:
+    This system implements full Zero-Copy IPC:
     1. **Control Plane (Kernel IPC):** Streamlit UI sends lightweight commands via `ioctl()`. The Linux Kernel writes them to a Ring Buffer and signals the Firmware via `eventfd`.
-    2. **Data Plane (TCP Bypass):** Large matrix weights and full memory state reads bypass the Kernel completely, using a local TCP socket to prevent kernel space memory congestion.
+    2. **Data Plane (Direct mmap):** Streamlit directly mmaps `/dev/vnpu0` for weight loading and result reading, completely eliminating TCP overhead and socket buffer copies.
     """)
-    st.graphviz_chart('''
-        digraph G {
-            rankdir=LR;
-            node [shape=box, style=filled, fillcolor=lightgrey];
-            UI [label="Streamlit UI (User Space)"];
-            Kernel [label="vNPU Driver (Kernel Space)", fillcolor=lightblue];
-            FW [label="Firmware (User Space)", fillcolor=lightgreen];
-            UI -> Kernel [label="ioctl (Commands)"];
-            Kernel -> FW [label="eventfd (IRQ Trigger)"];
-            UI -> FW [label="TCP 8080 (Weights/State)"];
-        }
-    ''')
+    
+    mm = get_shared_mmap()
+    if mm:
+        mm.seek(32)
+        total_cycles = struct.unpack('<Q', mm.read(8))[0]
+        st.metric("Total Simulated Cycles", total_cycles)
+        mm.close()
 
 with tab2:
     st.subheader("GPU Simulation: 2D Memory Manipulation")
@@ -140,13 +139,14 @@ with tab2:
     with colB:
         st.write("VRAM Buffer Visualization")
         if st.button("Fetch VRAM Frame"):
-            raw_state = read_npu_state()
-            if len(raw_state) >= HEADER_SIZE + NPU_MEM_BYTES:
-                npu_mem_raw = np.frombuffer(raw_state[HEADER_SIZE:HEADER_SIZE+NPU_MEM_BYTES], dtype=np.float32)
+            mm = get_shared_mmap()
+            if mm:
+                mm.seek(HEADER_SIZE)
+                raw_data = mm.read(NPU_MEM_BYTES)
+                npu_mem_raw = np.frombuffer(raw_data, dtype=np.float32)
                 img = npu_mem_raw.reshape((480, 640)).astype(np.uint8)
                 st.image(img, caption="640x480 VRAM View")
-            else:
-                st.error("Truncated data")
+                mm.close()
 
 with tab3:
     dim = st.number_input("Matrix Dimension", min_value=2, max_value=256, value=64, step=1)
@@ -163,25 +163,29 @@ with tab3:
         st.write("Matrix B")
         st.dataframe(st.session_state.mat_B, height=150)
 
-    if st.button("Push Weights"):
+    if st.button("Push Weights (Zero-Copy)"):
         send_weights(0, st.session_state.mat_A)
-        send_weights(dim * dim * 4, st.session_state.mat_B)
-        st.success("Memory updated via TCP")
+        send_weights(dim * dim, st.session_state.mat_B)
+        st.success("Memory updated via mmap")
 
     if st.button("CMD_MATRIX_MULTIPLY (Execute)"):
         res = submit_command(CMD_MATRIX_MULTIPLY, p0=0, p1=dim*dim, p2=dim*dim*2, p3=dim)
         st.code(res)
 
     if st.button("Pull GEMM Results"):
-        raw_state = read_npu_state()
-        if len(raw_state) >= HEADER_SIZE + NPU_MEM_BYTES:
-            npu_mem_raw = np.frombuffer(raw_state[HEADER_SIZE:HEADER_SIZE+NPU_MEM_BYTES], dtype=np.float32)
+        mm = get_shared_mmap()
+        if mm:
             offset_c = dim * dim * 2
-            mat_C = np.copy(npu_mem_raw[offset_c : offset_c + (dim * dim)]).reshape(dim, dim)
+            byte_offset = HEADER_SIZE + (offset_c * 4)
+            mm.seek(byte_offset)
+            raw_data = mm.read(dim * dim * 4)
+            mat_C = np.frombuffer(raw_data, dtype=np.float32).reshape(dim, dim)
+            
             expected_C = np.dot(st.session_state.mat_A, st.session_state.mat_B)
             mse = ((mat_C - expected_C)**2).mean()
             st.dataframe(mat_C, height=150)
             st.metric("Mean Squared Error (MSE)", f"{mse:.8f}")
+            mm.close()
 
 with tab4:
     st.subheader("Hardware Testing & Diagnostics")
@@ -195,17 +199,15 @@ with tab4:
             st.success(res)
             
         if st.button("Read Checksum Result"):
-            raw_state = read_npu_state()
-            npu_mem_raw = np.frombuffer(raw_state[HEADER_SIZE:HEADER_SIZE+NPU_MEM_BYTES], dtype=np.float32)
-            st.info(f"Value at offset {chk_dest}: {npu_mem_raw[chk_dest]}")
+            mm = get_shared_mmap()
+            if mm:
+                byte_offset = HEADER_SIZE + (chk_dest * 4)
+                mm.seek(byte_offset)
+                val = struct.unpack('<f', mm.read(4))[0]
+                st.info(f"Value at offset {chk_dest}: {val}")
+                mm.close()
 
     with c2:
-        st.write("Direct OOB Command (Bypass Kernel)")
-        diag_cmd_id = st.number_input("TCP Diag Command ID", 1, 99, 1)
-        if st.button("Send Direct TCP Command"):
-            reply = send_diagnostic_command(diag_cmd_id)
-            st.success(f"Response: {reply}")
-            
         st.write("Fault Injection")
         if st.button("CMD_HANG (Trigger Crash)"):
             res = submit_command(CMD_HANG)

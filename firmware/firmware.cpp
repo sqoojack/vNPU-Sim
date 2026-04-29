@@ -3,12 +3,11 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <unistd.h>
 #include <csignal>
 #include <atomic>
 #include <thread>
+#include <vector>
 #include <cstring>
 #include <fstream>
 #include <ucontext.h>
@@ -18,6 +17,10 @@
 
 #define LOG_FILE "firmware.log"
 #define TAG "Firmware"
+
+const uint64_t LATENCY_ALU = 1;
+const uint64_t LATENCY_L1_HIT = 2;
+const uint64_t LATENCY_DRAM_ACCESS = 100;
 
 vnpu_shared_state* global_npu_ptr = nullptr;
 
@@ -68,122 +71,51 @@ void watchdog_thread(vnpu_shared_state* npu) {
     }
 }
 
-bool recv_all(int socket, uint8_t* buffer, size_t length) {
-    size_t bytes_received = 0;
-    while (bytes_received < length) {
-        ssize_t result = read(socket, buffer + bytes_received, length - bytes_received);
-        if (result <= 0) return false;
-        bytes_received += result;
-    }
-    return true;
-}
-
-bool send_all(int socket, const uint8_t* buffer, size_t length) {
-    size_t bytes_sent = 0;
-    while (bytes_sent < length) {
-        ssize_t result = write(socket, buffer + bytes_sent, length - bytes_sent);
-        if (result <= 0) return false;
-        bytes_sent += result;
-    }
-    return true;
-}
-
-void tcp_server_thread(vnpu_shared_state* npu) {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
-    struct sockaddr_in address;
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(8080);
-    
-    bind(server_fd, (struct sockaddr *)&address, sizeof(address));
-    listen(server_fd, 3);
-    
-    LOG_INFO("TCP Server listening on port 8080", LOG_FILE, TAG);
-
-    while (npu->running) {
-        int client = accept(server_fd, NULL, NULL);
-        if (client < 0) continue;
-        
-        uint8_t mode;
-        if (recv_all(client, &mode, 1)) {
-            if (mode == 0) {
-                send_all(client, (const uint8_t*)npu, sizeof(vnpu_shared_state));
-            } else if (mode == 1) {
-                uint32_t offset, size_in_bytes;
-                if (recv_all(client, (uint8_t*)&offset, 4) && recv_all(client, (uint8_t*)&size_in_bytes, 4)) {
-                    uint32_t max_bytes = NPU_MEM_SIZE * sizeof(float);
-                    if (size_in_bytes <= max_bytes && offset <= (max_bytes - size_in_bytes)) {
-                        recv_all(client, (uint8_t*)npu->npu_mem + offset, size_in_bytes);
-                    } else {
-                        LOG_ERROR("TCP Write blocked: Out of bounds", LOG_FILE, TAG);
-                    }
-                }
-            } else if (mode == 2) {
-                uint32_t command_id;
-                if (recv_all(client, (uint8_t*)&command_id, 4)) {
-                    char response[64];
-                    snprintf(response, sizeof(response), "Firmware ACK cmd: %u", command_id);
-                    send_all(client, (const uint8_t*)response, strlen(response));
-                    LOG_INFO("Diag command executed", LOG_FILE, TAG);
-                }
-            }
-        }
-        close(client);
-    }
-}
-
 void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
+    uint64_t cycles_spent = 0;
+
     switch (cmd.type) {
         case CMD_CLEAR: {
             uint32_t color = cmd.params[0];
             for (uint32_t i = 0; i < NPU_MEM_SIZE; ++i) {
                 npu->npu_mem[i] = (float)color;
             }
+            cycles_spent += (NPU_MEM_SIZE / 16) * LATENCY_DRAM_ACCESS;
             LOG_INFO("Processed CMD_CLEAR", LOG_FILE, TAG);
             break;
         }
         case CMD_DRAW_RECT: {
-            uint32_t x = cmd.params[0];
-            uint32_t y = cmd.params[1];
-            uint32_t w = cmd.params[2];
-            uint32_t h = cmd.params[3];
-            uint32_t color = cmd.params[4]; 
-            
+            uint32_t x = cmd.params[0], y = cmd.params[1], w = cmd.params[2], h = cmd.params[3], color = cmd.params[4]; 
             for (uint32_t r = y; r < y + h && r < 480; ++r) {
                 for (uint32_t c = x; c < x + w && c < 640; ++c) {
                     npu->npu_mem[r * 640 + c] = (float)color;
                 }
             }
-            LOG_INFO("Processed CMD_DRAW_RECT (GPU Sim)", LOG_FILE, TAG);
+            cycles_spent += (w * h / 16) * LATENCY_DRAM_ACCESS;
+            LOG_INFO("Processed CMD_DRAW_RECT", LOG_FILE, TAG);
             break;
         }
         case CMD_CHECKSUM: { 
-            uint32_t offset = cmd.params[0];
-            uint32_t size = cmd.params[1];
-            uint32_t dest_offset = cmd.params[2];
-            
+            uint32_t offset = cmd.params[0], size = cmd.params[1], dest_offset = cmd.params[2];
             if (offset + size <= NPU_MEM_SIZE && dest_offset < NPU_MEM_SIZE) {
                 uint32_t sum = 0;
                 for (uint32_t i = offset; i < offset + size; ++i) {
                     sum += (uint32_t)npu->npu_mem[i];
                 }
                 npu->npu_mem[dest_offset] = (float)sum;
+                cycles_spent += size * LATENCY_DRAM_ACCESS + size * LATENCY_ALU;
                 LOG_INFO("Processed CMD_CHECKSUM", LOG_FILE, TAG);
             } else {
-                LOG_ERROR("CMD_CHECKSUM bounds check failed", LOG_FILE, TAG);
+                LOG_ERROR("CMD_CHECKSUM bounds error", LOG_FILE, TAG);
             }
             break;
         }
         case CMD_MATRIX_MULTIPLY: {
-            uint32_t offA = cmd.params[0], offB = cmd.params[1], offC = cmd.params[2];
-            uint32_t dim = cmd.params[3]; 
-            
+            uint32_t offA = cmd.params[0], offB = cmd.params[1], offC = cmd.params[2], dim = cmd.params[3]; 
             uint64_t req_space = (uint64_t)dim * dim;
+            
             if ((offA + req_space > NPU_MEM_SIZE) || (offB + req_space > NPU_MEM_SIZE) || (offC + req_space > NPU_MEM_SIZE)) {
-                LOG_ERROR("CMD_MATRIX_MULTIPLY bounds check failed", LOG_FILE, TAG);
+                LOG_ERROR("CMD_MATRIX_MULTIPLY bounds error", LOG_FILE, TAG);
                 break;
             }
 
@@ -191,26 +123,60 @@ void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
             float* B = &npu->npu_mem[offB];
             float* C = &npu->npu_mem[offC];
             
-            for (uint32_t i = 0; i < dim; ++i) {
-                for (uint32_t j = 0; j < dim; ++j) {
-                    float sum = 0;
-                    for (uint32_t k = 0; k < dim; ++k) {
-                        sum += A[i * dim + k] * B[k * dim + j];
+            uint32_t num_threads = std::thread::hardware_concurrency();
+            if (num_threads == 0) num_threads = 4;
+            std::vector<std::thread> workers;
+            
+            auto worker_task = [&](uint32_t start_row, uint32_t end_row) {
+                for (uint32_t i = start_row; i < end_row; ++i) {
+                    for (uint32_t j = 0; j < dim; ++j) {
+                        float sum = 0;
+                        for (uint32_t k = 0; k < dim; ++k) {
+                            sum += A[i * dim + k] * B[k * dim + j];
+                        }
+                        C[i * dim + j] = sum;
                     }
-                    C[i * dim + j] = sum;
                 }
+            };
+
+            uint32_t rows_per_thread = dim / num_threads;
+            for (uint32_t t = 0; t < num_threads; ++t) {
+                uint32_t start_row = t * rows_per_thread;
+                uint32_t end_row = (t == num_threads - 1) ? dim : start_row + rows_per_thread;
+                workers.emplace_back(worker_task, start_row, end_row);
             }
+            
+            for (auto& w : workers) {
+                w.join();
+            }
+
+            uint64_t total_ops = (uint64_t)dim * dim * dim;
+            uint64_t dram_loads = dim * dim * 2;
+            uint64_t l1_hits = total_ops * 2 - dram_loads; 
+            cycles_spent += (dram_loads * LATENCY_DRAM_ACCESS) + (l1_hits * LATENCY_L1_HIT) + (total_ops * LATENCY_ALU);
+            cycles_spent /= num_threads; 
+            
             npu->temperature += 1.5f; 
+            LOG_INFO("Processed CMD_MATRIX_MULTIPLY with parallel workers", LOG_FILE, TAG);
+            break;
+        }
+        case CMD_MEM_TRANSFER: {
+            uint32_t src_offset = cmd.params[0], dest_offset = cmd.params[1], size = cmd.params[2], is_l1_dest = cmd.params[3];
+            if (is_l1_dest && dest_offset + size <= L1_CACHE_SIZE && src_offset + size <= NPU_MEM_SIZE) {
+                std::memcpy(&npu->l1_cache[dest_offset], &npu->npu_mem[src_offset], size * sizeof(float));
+                cycles_spent += size * LATENCY_DRAM_ACCESS;
+            }
+            LOG_INFO("Processed CMD_MEM_TRANSFER", LOG_FILE, TAG);
             break;
         }
         case CMD_VECTOR_ADD: {
-            uint32_t offA = cmd.params[0], offB = cmd.params[1], offC = cmd.params[2];
-            uint32_t len = cmd.params[3];
+            uint32_t offA = cmd.params[0], offB = cmd.params[1], offC = cmd.params[2], len = cmd.params[3];
             float* A = &npu->npu_mem[offA];
             float* B = &npu->npu_mem[offB];
             float* C = &npu->npu_mem[offC];
             for(uint32_t i = 0; i < len; ++i) C[i] = A[i] + B[i];
-            LOG_INFO("Processed GPU Vector Add", LOG_FILE, TAG);
+            cycles_spent += len * LATENCY_DRAM_ACCESS * 3 + len * LATENCY_ALU;
+            LOG_INFO("Processed CMD_VECTOR_ADD", LOG_FILE, TAG);
             break;
         }
         case CMD_HANG: {
@@ -220,6 +186,7 @@ void process_command(vnpu_shared_state* npu, vnpu_command& cmd) {
             break;
         }
     }
+    npu->total_cycles += cycles_spent;
 }
 
 int main() {
@@ -255,15 +222,13 @@ int main() {
     } else {
         npu->temperature = 37.0f;
         npu->watchdog_reset_count = 0;
+        npu->total_cycles = 0;
     }
 
     int irq_fd = eventfd(0, EFD_NONBLOCK);
     ioctl(fd, VNPU_IOCTL_SET_EVENTFD, irq_fd);
 
     npu->running = 1;
-    
-    std::thread net_thread(tcp_server_thread, npu);
-    net_thread.detach();
 
     std::thread wd_thread(watchdog_thread, npu);
     wd_thread.detach();
